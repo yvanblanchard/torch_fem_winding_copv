@@ -1,24 +1,31 @@
 """Drone wing spar: concurrent topology + continuous-fiber orientation optimization.
 
-The spar is a flat, tapered composite plate in the X-Y plane (span along X,
-chord along Y), clamped at the root (x = L) and loaded at the tip (x = 0) by
+The spar is a flat composite plate in the X-Y plane (span along X, chord along
+Y), its planform, supports and load points read from the reference sketch:
 
-* DRAG - an in-plane force along -Y  (membrane / in-plane bending),
-* LIFT - an out-of-plane force along +Z (plate bending + torsion).
+* ROOT - three bolted fittings (top chord, middle, bottom chord) at x = L,
+* DRAG - in-plane force along -Y on the leading-edge rib stations,
+* LIFT - out-of-plane force along +Z on all rib stations (bending + torsion).
 
 Both load cases need a `Shell` model (membrane + bending), so this is the shell
 counterpart of torch-fem's `optimization/planar/topology+orientation.ipynb`
-example: SIMP densities updated with an optimality-criteria step and
-element-wise fiber angles updated with the compliance gradient. Two additions
-make the result manufacturable as *continuous* fibers:
+example: densities (density filter + Heaviside projection, SIMP) updated with
+an optimality-criteria step and element-wise fiber angles updated with the
+compliance gradient, regularized in doubled-angle space (cos 2θ, sin 2θ).
 
-1. The orientation field is regularized every iteration by filtering the
-   director in doubled-angle space (cos 2θ, sin 2θ), so that neighbouring
-   elements get similar angles and streamlines do not kink.
-2. After the optimization, evenly-spaced streamlines (Jobard-Lefer) are traced
-   through the solid region of the optimized orientation field. Each streamline
-   is one continuous, uncut fiber path; they are exported as polylines (CSV and
-   JSON) and chained into one print sequence for continuous-fiber AM / AFP.
+Continuous fiber paths are then generated from the optimized design:
+
+* "skeleton" (default): member centerlines are extracted, joined through
+  junctions by the straightest continuation into load paths, and filled with
+  parallel tows (one bundle per member, count from the member width).
+* "streamline": evenly spaced streamlines of the orientation field.
+
+Paths are exported as polylines (CSV and JSON) and chained into one print
+sequence for continuous-fiber AM / AFP.
+
+Usage:
+    python wing_spar_fiber_topopt.py               # optimize + paths
+    python wing_spar_fiber_topopt.py --paths-only  # paths from saved design
 """
 
 import json
@@ -29,7 +36,14 @@ import numpy as np
 import torch
 from scipy.interpolate import PchipInterpolator, RegularGridInterpolator, griddata
 from scipy.optimize import bisect
-from scipy.spatial import cKDTree
+from scipy.ndimage import distance_transform_edt, gaussian_filter1d, label
+from skimage.morphology import (
+    closing,
+    disk,
+    remove_small_holes,
+    remove_small_objects,
+    skeletonize,
+)
 from tqdm import tqdm
 
 from torchfem import Shell
@@ -86,6 +100,14 @@ RHO_SOLID = 0.2  # density threshold that defines the printed region
 # Intermediate densities are realized with fewer tows: the local path spacing
 # is TOW_SPACING / rho, i.e. fiber volume per unit width is proportional to rho.
 STEP = 0.5  # mm - streamline integration step
+# "skeleton": tows laid parallel to member centerlines, joined through junctions
+#             by the straightest continuation (one fiber bundle per load path).
+# "streamline": evenly spaced streamlines of the optimized orientation field.
+PATH_METHOD = "skeleton"
+RHO_MEMBER = 0.5  # density threshold of the member mask for the skeleton
+SPUR_LEN = 15.0  # mm - skeleton branches shorter than this are pruned
+MAX_TURN = 55.0  # deg - max fiber direction change when passing a junction
+SMOOTH = 4.0  # mm - Gaussian smoothing length of the member centerlines
 
 OUT = Path("wing_spar_output")
 
@@ -305,6 +327,8 @@ class DirectorField:
         self.c2 = RegularGridInterpolator((self.gx, self.gy), fields[0], **opts)
         self.s2 = RegularGridInterpolator((self.gx, self.gy), fields[1], **opts)
         self.rho = RegularGridInterpolator((self.gx, self.gy), fields[2], **opts)
+        self.res = res
+        self.rho_grid = fields[2]
 
     def inside(self, p):
         if p[0] < 0.0 or p[0] > L:
@@ -430,6 +454,200 @@ def evenly_spaced_streamlines(field, d_sep, d_test_ratio=0.5, min_len=30.0):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Continuous fiber paths along the member skeleton
+# ---------------------------------------------------------------------------
+
+_NB = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+
+def member_mask(field):
+    """Binary member mask on the background grid, cleaned for skeletonization."""
+    X, Y = np.meshgrid(field.gx, field.gy, indexing="ij")
+    y_b, y_t = _te(X), _le(X)
+    mask = (field.rho_grid >= RHO_MEMBER) & (Y >= y_b) & (Y <= y_t)
+    mask = closing(mask, disk(2))
+    mask = remove_small_holes(mask, max_size=60)
+    mask = remove_small_objects(mask, max_size=60)
+    return mask
+
+
+def skeleton_graph(mask):
+    """Skeleton split into edges (pixel chains) between junction clusters."""
+    skel = skeletonize(mask)
+    pad = np.pad(skel, 1)
+    nbr = sum(np.roll(np.roll(pad, di, 0), dj, 1) for di, dj in _NB)[1:-1, 1:-1]
+    junction = skel & (nbr >= 3)
+    j_lab, n_j = label(junction, structure=np.ones((3, 3)))
+    j_xy = np.array([np.argwhere(j_lab == k + 1).mean(0) for k in range(n_j)])
+    e_lab, n_e = label(skel & ~junction, structure=np.ones((3, 3)))
+
+    edges = []
+    for k in range(1, n_e + 1):
+        pix = {tuple(p) for p in np.argwhere(e_lab == k)}
+
+        def nbrs(p):
+            return [(p[0] + a, p[1] + b) for a, b in _NB if (p[0] + a, p[1] + b) in pix]
+
+        start = next((p for p in pix if len(nbrs(p)) <= 1), next(iter(pix)))
+        chain, seen = [start], {start}
+        while True:
+            nxt = [q for q in nbrs(chain[-1]) if q not in seen]
+            if not nxt:
+                break
+            chain.append(nxt[0])
+            seen.add(nxt[0])
+
+        def touching(p):
+            js = {j_lab[p[0] + a, p[1] + b] for a, b in _NB
+                  if 0 <= p[0] + a < skel.shape[0] and 0 <= p[1] + b < skel.shape[1]}
+            js.discard(0)
+            return min(js) - 1 if js else None
+
+        ends = (touching(chain[0]), touching(chain[-1]))
+        pts = np.array(chain, dtype=float)
+        if ends[0] is not None:
+            pts = np.vstack([j_xy[ends[0]], pts])
+        if ends[1] is not None:
+            pts = np.vstack([pts, j_xy[ends[1]]])
+        edges.append({"pts": pts, "ends": list(ends)})
+    return edges, j_xy
+
+
+def polyline_length(p):
+    return np.linalg.norm(np.diff(p, axis=0), axis=1).sum() if len(p) > 1 else 0.0
+
+
+def end_direction(pts, at_start, span=10):
+    """Unit tangent pointing out of the polyline at one end."""
+    seg = pts[: span + 1] if at_start else pts[-span - 1 :][::-1]
+    d = seg[0] - seg[-1]
+    return d / (np.linalg.norm(d) + 1e-12)
+
+
+def build_strokes(edges):
+    """Join edges through junctions by the straightest continuation."""
+    # Prune short dangling spurs
+    edges = [e for e in edges
+             if not ((e["ends"][0] is None or e["ends"][1] is None)
+                     and polyline_length(e["pts"]) < SPUR_LEN)]
+    # Incident edge-ends per junction
+    inc = {}
+    for i, e in enumerate(edges):
+        for side, j in enumerate(e["ends"]):
+            if j is not None:
+                inc.setdefault(j, []).append((i, side))
+    # Greedy pairing at each junction: most opposite directions first
+    link = {}
+    cos_max = -np.cos(np.deg2rad(MAX_TURN))
+    for j, ends in inc.items():
+        dirs = {(i, s): end_direction(edges[i]["pts"], s == 0) for i, s in ends}
+        cand = sorted(
+            ((dirs[a] @ dirs[b], a, b) for ia, a in enumerate(ends)
+             for b in ends[ia + 1 :] if a[0] != b[0]),
+            key=lambda t: t[0],
+        )
+        for c, a, b in cand:
+            if c <= cos_max and a not in link and b not in link:
+                link[a], link[b] = b, a
+    # Walk chains of linked edges
+    used, strokes = set(), []
+    for i0 in range(len(edges)):
+        if i0 in used:
+            continue
+        # Go to one end of the chain
+        i, side = i0, 0
+        seen = {i0}
+        while (i, side) in link:
+            i, s2 = link[(i, side)]
+            if i in seen:
+                break
+            seen.add(i)
+            side = 1 - s2
+        # Walk forward from (i, side)
+        pts, cur, entry = [], i, side
+        while cur is not None and cur not in used:
+            used.add(cur)
+            p = edges[cur]["pts"]
+            p = p if entry == 0 else p[::-1]
+            pts.append(p if not pts else p[1:])
+            nxt = link.get((cur, 1 - entry))
+            cur, entry = (nxt if nxt is not None else (None, None))
+        strokes.append(np.vstack(pts))
+    return strokes
+
+
+def resample(p, ds=1.0):
+    s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))])
+    t = np.arange(0.0, s[-1] + 1e-9, ds)
+    return np.column_stack([np.interp(t, s, p[:, 0]), np.interp(t, s, p[:, 1])])
+
+
+def extend_free_end(p, mask, field, at_start):
+    """Extend a free stroke end along its tangent to the member boundary."""
+    d = end_direction(p, at_start)
+    q = p[0] if at_start else p[-1]
+    ext = []
+    for _ in range(40):
+        q = q + d * field.res
+        i = int(round((q[0] - field.gx[0]) / field.res))
+        j = int(round((q[1] - field.gy[0]) / field.res))
+        if not (0 <= i < mask.shape[0] and 0 <= j < mask.shape[1]) or not mask[i, j]:
+            break
+        ext.append(q.copy())
+    if not ext:
+        return p
+    ext = np.array(ext)
+    return np.vstack([ext[::-1], p]) if at_start else np.vstack([p, ext])
+
+
+def skeleton_paths(field):
+    """Continuous tows: offsets of smoothed member centerlines (load paths)."""
+    mask = member_mask(field)
+    half_width = distance_transform_edt(mask) * field.res
+    edges, _ = skeleton_graph(mask)
+    strokes_px = build_strokes(edges)
+
+    to_xy = lambda p: np.column_stack(  # noqa: E731
+        [field.gx[0] + p[:, 0] * field.res, field.gy[0] + p[:, 1] * field.res]
+    )
+    hw = RegularGridInterpolator((field.gx, field.gy), half_width,
+                                 bounds_error=False, fill_value=0.0)
+    strokes, tows = [], []
+    for sp in strokes_px:
+        p = resample(to_xy(sp))
+        if polyline_length(p) < SPUR_LEN or len(p) < 5:
+            continue
+        sig = SMOOTH / field.res
+        p_s = np.column_stack([gaussian_filter1d(p[:, k], sig, mode="nearest")
+                               for k in (0, 1)])
+        p_s = extend_free_end(p_s, mask, field, True)
+        p_s = extend_free_end(p_s, mask, field, False)
+        p_s = resample(p_s)
+        strokes.append(p_s)
+        # Number of tows from the member width along the stroke
+        width = 2.0 * np.median(hw(p_s))
+        n = max(1, int(round(width / TOW_SPACING)))
+        t = np.gradient(p_s, axis=0)
+        t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-12
+        nrm = np.column_stack([-t[:, 1], t[:, 0]])
+        for k in range(n):
+            off = (k - 0.5 * (n - 1)) * TOW_SPACING
+            tows.append(p_s + off * nrm)
+    return tows, strokes
+
+
+def fiber_alignment(field, strokes):
+    """Mean |cos| between optimized fiber angle and the load-path tangent."""
+    vals = []
+    for p in strokes:
+        t = np.gradient(p, axis=0)
+        t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-12
+        a = 0.5 * np.arctan2(field.s2(p), field.c2(p))
+        vals.append(np.abs(t[:, 0] * np.cos(a) + t[:, 1] * np.sin(a)))
+    return float(np.mean(np.concatenate(vals)))
+
+
 def chain_paths(paths):
     """Order and orient paths greedily into one continuous print sequence."""
     remaining = list(range(len(paths)))
@@ -544,7 +762,13 @@ def generate_paths():
     xy = nodes[:, :2].numpy()
 
     field = DirectorField(c_np, th_np, rho_np)
-    paths = evenly_spaced_streamlines(field, TOW_SPACING)
+    if PATH_METHOD == "skeleton":
+        paths, strokes = skeleton_paths(field)
+        align = fiber_alignment(field, strokes)
+        print(f"{len(strokes)} load paths; optimized fibers vs. path tangent: "
+              f"mean |cos| = {align:.3f}")
+    else:
+        paths = evenly_spaced_streamlines(field, TOW_SPACING)
     ordered, travel = chain_paths(paths)
     export_paths(paths, ordered)
     fiber_len = sum(np.linalg.norm(np.diff(p, axis=0), axis=1).sum() for p in paths)
