@@ -27,7 +27,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from scipy.interpolate import RegularGridInterpolator, griddata
+from scipy.interpolate import PchipInterpolator, RegularGridInterpolator, griddata
 from scipy.optimize import bisect
 from scipy.spatial import cKDTree
 from tqdm import tqdm
@@ -40,30 +40,37 @@ from torchfem.rotations import planar_rotation
 torch.set_default_dtype(torch.float64)
 
 
-# --- Geometry (mm) - tapered planform read from the sketch ---
+# --- Geometry (mm) - read from the reference sketch (1 px = 0.84 mm) ---
 L = 600.0  # span, tip at x = 0, root at x = L
-Y_TIP = (76.0, 204.0)  # (trailing, leading) edge y at the tip   -> chord 128
-Y_ROOT = (36.0, 244.0)  # (trailing, leading) edge y at the root -> chord 208
+# Leading edge (upper chord, arched) and trailing edge (lower chord)
+LE_PTS = ([0.0, 243.0, 394.0, 600.0], [214.0, 243.0, 264.0, 256.0])
+TE_PTS = ([0.0, 310.0, 600.0], [84.0, 59.0, 42.0])
 THICKNESS = 6.0  # mm - spar plate thickness
 
 # --- Mesh ---
 NX = 96  # elements along the span
 NY = 32  # elements along the chord
 
+# --- Boundary conditions (from the sketch) ---
+# Root: three bolted fittings (top chord, middle member, bottom chord) instead
+# of a fully clamped edge. Bands are y-ranges on the root edge.
+ROOT_FITTINGS = [(236.0, 256.0), (152.0, 178.0), (42.0, 60.0)]
+# Load introduction: rib stations = stubs leaving the planform in the sketch,
+# plus the two tip corners. (x, edge) with edge "le" or "te".
+STATIONS = [(0.0, "le"), (231.0, "le"), (399.0, "le"),
+            (0.0, "te"), (80.0, "te"), (310.0, "te")]
+PAD_RADIUS = 9.0  # mm - passive solid pad around each station / fitting
+
 # --- Loads (N) ---
-# "tip": both resultants at the tip edge (as drawn) -> two-bar V truss.
-# "distributed": elliptic span loading introduced along the leading and
-# trailing edges (where the ribs / skin attach) -> chords + branching ribs.
-LOAD_MODE = "distributed"
-DRAG = 60.0  # in-plane resultant, -Y
-LIFT = 120.0  # out-of-plane resultant, +Z
-LIFT_LE_SHARE = 0.6  # share of lift on the leading edge (center of pressure)
+DRAG = 60.0  # in-plane resultant, -Y, on the leading-edge stations
+LIFT = 120.0  # out-of-plane resultant, +Z, on all stations
+TIP_SHARE = 0.5  # share of each resultant carried by the tip stations
 W_DRAG = 0.5  # weight of the (normalized) drag compliance
 W_LIFT = 0.5  # weight of the (normalized) lift compliance
 
 # --- Optimization ---
 P_SIMP = 3.0
-VOLFRAC = 0.30
+VOLFRAC = 0.22
 MOVE = 0.1
 N_ITER = 180
 FILTER_RADIUS = 2.0  # in element sizes, density filter
@@ -80,7 +87,7 @@ RHO_SOLID = 0.2  # density threshold that defines the printed region
 # is TOW_SPACING / rho, i.e. fiber volume per unit width is proportional to rho.
 STEP = 0.5  # mm - streamline integration step
 
-OUT = Path(f"wing_spar_output_{LOAD_MODE}")
+OUT = Path("wing_spar_output")
 
 # Carbon / epoxy (same lamina as copv_winding_fea.py)
 cfrp = OrthotropicElasticityPlaneStress(
@@ -94,15 +101,19 @@ cfrp = OrthotropicElasticityPlaneStress(
 )
 
 
+_le = PchipInterpolator(*LE_PTS)
+_te = PchipInterpolator(*TE_PTS)
+
+
 def y_edges(x):
     """Trailing and leading edge y-coordinates at span station x."""
-    s = x / L
-    y_b = Y_TIP[0] + s * (Y_ROOT[0] - Y_TIP[0])
-    y_t = Y_TIP[1] + s * (Y_ROOT[1] - Y_TIP[1])
-    return y_b, y_t
+    if isinstance(x, torch.Tensor):
+        xn = x.numpy()
+        return torch.as_tensor(_te(xn)), torch.as_tensor(_le(xn))
+    return float(_te(x)), float(_le(x))
 
 
-# Mesh: structured triangles on the unit square, mapped onto the trapezoid
+# Mesh: structured triangles on the unit square, mapped onto the planform
 uv, elements = rect_tri(NX + 1, NY + 1, 1.0, 1.0, variant="zigzag")
 x = uv[:, 0] * L
 y_b, y_t = y_edges(x)
@@ -114,33 +125,43 @@ n_elem = spar.n_elem
 centers = nodes[elements].mean(dim=1)
 uv_c = uv[elements].mean(dim=1)
 
-
 tol = 1e-6
-tip = x < tol
 root = x > L - tol
+le_edge = uv[:, 1] > 1.0 - tol
+te_edge = uv[:, 1] < tol
+h = L / NX
 
-# Clamped root
-spar.constraints[root, :] = True
+# Root fittings: clamp the root-edge nodes inside each band
+passive = centers[:, 0] < 1.5 * h  # tip rib
+for y_lo, y_hi in ROOT_FITTINGS:
+    spar.constraints[root & (y >= y_lo - tol) & (y <= y_hi + tol), :] = True
+    y_mid = 0.5 * (y_lo + y_hi)
+    pad = (centers[:, 0] > L - 2.0 * h) & (
+        (centers[:, 1] - y_mid).abs() < 0.5 * (y_hi - y_lo) + 0.5 * h
+    )
+    passive |= pad
 
-# Load vectors for the two load cases, spread over the tip edge
+# Loads at the rib stations, each on the nearest edge node
 f_drag = torch.zeros_like(spar.forces)
 f_lift = torch.zeros_like(spar.forces)
-if LOAD_MODE == "tip":
-    f_drag[tip, 1] = -DRAG / tip.sum()
-    f_lift[tip, 2] = LIFT / tip.sum()
-else:
-    # Elliptic distribution in span coordinate eta (0 at root, 1 at tip)
-    eta = 1.0 - x / L
-    q = torch.sqrt(torch.clamp(1.0 - eta**2, min=0.0)) * (~root)
-    le = (uv[:, 1] > 1.0 - tol) & ~root
-    te = (uv[:, 1] < tol) & ~root
-    f_drag[le, 1] = -DRAG * q[le] / q[le].sum()
-    f_lift[le, 2] = LIFT_LE_SHARE * LIFT * q[le] / q[le].sum()
-    f_lift[te, 2] = (1.0 - LIFT_LE_SHARE) * LIFT * q[te] / q[te].sum()
-
-# Passive solid elements: tip rib (load introduction) and root fitting
-h = L / NX
-passive = (centers[:, 0] < 1.5 * h) | (centers[:, 0] > L - 1.5 * h)
+station_xy = []
+n_tip = sum(1 for xs, _ in STATIONS if xs == 0.0)
+n_rib = len(STATIONS) - n_tip
+n_tip_le = sum(1 for xs, e in STATIONS if xs == 0.0 and e == "le")
+n_rib_le = sum(1 for xs, e in STATIONS if xs > 0.0 and e == "le")
+for xs, edge in STATIONS:
+    on_edge = le_edge if edge == "le" else te_edge
+    idx = torch.nonzero(on_edge).ravel()
+    k = idx[torch.argmin((x[idx] - xs).abs())]
+    station_xy.append(nodes[k, :2].tolist())
+    tip_station = xs == 0.0
+    w_lift = TIP_SHARE / n_tip if tip_station else (1 - TIP_SHARE) / n_rib
+    f_lift[k, 2] += w_lift * LIFT
+    if edge == "le":
+        w_drag = TIP_SHARE / n_tip_le if tip_station else (1 - TIP_SHARE) / n_rib_le
+        f_drag[k, 1] -= w_drag * DRAG
+    passive |= torch.linalg.norm(centers[:, :2] - nodes[k, :2], dim=1) < PAD_RADIUS
+station_xy = np.array(station_xy)
 active = ~passive
 
 # Filters in element-size units on the parametric grid (elements are
@@ -272,7 +293,7 @@ class DirectorField:
     def __init__(self, centers, theta, rho, res=1.0):
         xc, yc = centers[:, 0], centers[:, 1]
         self.gx = np.arange(0.0, L + res, res)
-        self.gy = np.arange(min(Y_ROOT[0], Y_TIP[0]), max(Y_ROOT[1], Y_TIP[1]) + res, res)
+        self.gy = np.arange(min(TE_PTS[1]) - res, max(_le(np.linspace(0, L, 200))) + res, res)
         X, Y = np.meshgrid(self.gx, self.gy, indexing="ij")
         pts = np.column_stack([xc, yc])
         fields = []
@@ -454,6 +475,19 @@ def export_paths(paths, ordered):
     (OUT / "fiber_paths.json").write_text(json.dumps(data))
 
 
+def draw_bcs(ax):
+    """Root fittings, rib stations and load symbols."""
+    for i, (y_lo, y_hi) in enumerate(ROOT_FITTINGS):
+        ax.plot([L + 3, L + 3], [y_lo, y_hi], color="tab:blue", lw=5,
+                label="root fittings (clamped)" if i == 0 else None)
+    drag = station_xy[[e == "le" for _, e in STATIONS]]
+    ax.quiver(drag[:, 0], drag[:, 1] + 28, 0, -1, color="tab:blue",
+              scale=12, width=0.004, label="drag (-y)")
+    ax.plot(station_xy[:, 0], station_xy[:, 1], "o", ms=9, mfc="none",
+            mec="tab:red", mew=2, label="lift (+z) / rib stations")
+    ax.plot(station_xy[:, 0], station_xy[:, 1], ".", color="tab:red")
+
+
 def run_optimization():
     # Random (smoothed) initial fiber field: a uniform 0 deg start is a
     # stationary point for members loaded along the chord.
@@ -496,6 +530,7 @@ def run_optimization():
         width=0.0015, color="tab:orange", scale=90,
     )
     ax.set_aspect("equal")
+    draw_bcs(ax)
     ax.set_title("Optimized density and fiber orientation")
     fig.tight_layout()
     fig.savefig(OUT / "density_orientation.png", dpi=150)
@@ -520,18 +555,12 @@ def generate_paths():
     ax.tripcolor(xy[:, 0], xy[:, 1], tri, facecolors=rho_np, cmap="Greys", vmin=0, vmax=2.5)
     for line in paths:
         ax.plot(line[:, 0], line[:, 1], "-", color="k", lw=0.8)
-    ax.plot([L, L], list(Y_ROOT), color="tab:blue", lw=4, label="root (clamped)")
-    ax.annotate("", xy=(5, Y_TIP[1] - 40), xytext=(5, Y_TIP[1] + 20),
-                arrowprops=dict(color="tab:blue", width=2))
-    ax.text(10, Y_TIP[1] + 10, "DRAG", color="tab:blue")
-    ax.plot(5, Y_TIP[0] + 10, "o", ms=10, mfc="none", mec="tab:blue", mew=2)
-    ax.plot(5, Y_TIP[0] + 10, ".", color="tab:blue")
-    ax.text(10, Y_TIP[0] - 5, "LIFT (+z)", color="tab:blue")
+    draw_bcs(ax)
     ax.set_aspect("equal")
     ax.set_title(
         f"Continuous fiber paths ({len(paths)} tows, spacing {TOW_SPACING} mm / density)"
     )
-    ax.legend(loc="lower right")
+    ax.legend(loc="lower left", fontsize=7)
     fig.tight_layout()
     fig.savefig(OUT / "fiber_paths.png", dpi=200)
 
