@@ -39,8 +39,6 @@ from torchfem.rotations import planar_rotation
 
 torch.set_default_dtype(torch.float64)
 
-OUT = Path("wing_spar_output")
-OUT.mkdir(exist_ok=True)
 
 # --- Geometry (mm) - tapered planform read from the sketch ---
 L = 600.0  # span, tip at x = 0, root at x = L
@@ -53,8 +51,13 @@ NX = 96  # elements along the span
 NY = 32  # elements along the chord
 
 # --- Loads (N) ---
-DRAG = 60.0  # in-plane, -Y, at the tip
-LIFT = 120.0  # out-of-plane, +Z, at the tip
+# "tip": both resultants at the tip edge (as drawn) -> two-bar V truss.
+# "distributed": elliptic span loading introduced along the leading and
+# trailing edges (where the ribs / skin attach) -> chords + branching ribs.
+LOAD_MODE = "distributed"
+DRAG = 60.0  # in-plane resultant, -Y
+LIFT = 120.0  # out-of-plane resultant, +Z
+LIFT_LE_SHARE = 0.6  # share of lift on the leading edge (center of pressure)
 W_DRAG = 0.5  # weight of the (normalized) drag compliance
 W_LIFT = 0.5  # weight of the (normalized) lift compliance
 
@@ -71,6 +74,8 @@ ORI_MAX_STEP = 0.15  # rad - max fiber angle change per iteration
 TOW_SPACING = 5.0  # mm - distance between neighbouring fiber paths
 RHO_SOLID = 0.5  # density threshold that defines the printed region
 STEP = 0.5  # mm - streamline integration step
+
+OUT = Path(f"wing_spar_output_{LOAD_MODE}")
 
 # Carbon / epoxy (same lamina as copv_winding_fea.py)
 cfrp = OrthotropicElasticityPlaneStress(
@@ -114,9 +119,19 @@ spar.constraints[root, :] = True
 
 # Load vectors for the two load cases, spread over the tip edge
 f_drag = torch.zeros_like(spar.forces)
-f_drag[tip, 1] = -DRAG / tip.sum()
 f_lift = torch.zeros_like(spar.forces)
-f_lift[tip, 2] = LIFT / tip.sum()
+if LOAD_MODE == "tip":
+    f_drag[tip, 1] = -DRAG / tip.sum()
+    f_lift[tip, 2] = LIFT / tip.sum()
+else:
+    # Elliptic distribution in span coordinate eta (0 at root, 1 at tip)
+    eta = 1.0 - x / L
+    q = torch.sqrt(torch.clamp(1.0 - eta**2, min=0.0)) * (~root)
+    le = (uv[:, 1] > 1.0 - tol) & ~root
+    te = (uv[:, 1] < tol) & ~root
+    f_drag[le, 1] = -DRAG * q[le] / q[le].sum()
+    f_lift[le, 2] = LIFT_LE_SHARE * LIFT * q[le] / q[le].sum()
+    f_lift[te, 2] = (1.0 - LIFT_LE_SHARE) * LIFT * q[te] / q[te].sum()
 
 # Passive solid elements: tip rib (load introduction) and root fitting
 h = L / NX
@@ -315,7 +330,7 @@ def trace(field, paths, seed, d_test, max_len=5.0 * L):
     return np.array(halves[1][::-1] + [seed] + halves[0])
 
 
-def evenly_spaced_streamlines(field, d_sep, d_test_ratio=0.5, min_len=10.0):
+def evenly_spaced_streamlines(field, d_sep, d_test_ratio=0.5, min_len=30.0):
     """Jobard-Lefer: seed new streamlines at d_sep from accepted ones."""
     paths = PathSet(cell=d_sep)
     d_test = d_test_ratio * d_sep
@@ -402,6 +417,7 @@ def export_paths(paths, ordered):
 
 
 def main():
+    OUT.mkdir(exist_ok=True)
     theta = torch.zeros(n_elem, requires_grad=True)  # fibers along the span
     rho = VOLFRAC * torch.ones(n_elem)
     rho[passive] = 1.0
