@@ -65,14 +65,19 @@ W_LIFT = 0.5  # weight of the (normalized) lift compliance
 P_SIMP = 3.0
 VOLFRAC = 0.30
 MOVE = 0.1
-N_ITER = 150
-FILTER_RADIUS = 1.6  # in element sizes, density sensitivity filter
-ORI_FILTER_RADIUS = 2.5  # in element sizes, orientation regularization
+N_ITER = 180
+FILTER_RADIUS = 2.0  # in element sizes, density filter
+BETA_START = 40  # Heaviside projection: beta = 1 until this iteration,
+BETA_EVERY = 20  # then doubled every BETA_EVERY iterations
+BETA_MAX = 16.0
+ORI_FILTER_RADIUS = 1.6  # in element sizes, orientation regularization
 ORI_MAX_STEP = 0.15  # rad - max fiber angle change per iteration
 
 # --- Fiber paths ---
 TOW_SPACING = 5.0  # mm - distance between neighbouring fiber paths
-RHO_SOLID = 0.5  # density threshold that defines the printed region
+RHO_SOLID = 0.2  # density threshold that defines the printed region
+# Intermediate densities are realized with fewer tows: the local path spacing
+# is TOW_SPACING / rho, i.e. fiber volume per unit width is proportional to rho.
 STEP = 0.5  # mm - streamline integration step
 
 OUT = Path(f"wing_spar_output_{LOAD_MODE}")
@@ -189,44 +194,68 @@ def smooth_orientation(theta, rho):
     return 0.5 * torch.atan2(s, c)
 
 
-def optimize(rho, theta, n_iter=N_ITER):
-    rho_min = 1e-3 * torch.ones_like(rho)
-    rho_max = torch.ones_like(rho)
+def physical_density(x, beta, eta=0.5):
+    """Density filter followed by a smoothed Heaviside projection."""
+    x_t = (H @ x) / H.sum(dim=1)
+    num = torch.tanh(torch.tensor(beta * eta)) + torch.tanh(beta * (x_t - eta))
+    den = torch.tanh(torch.tensor(beta * eta)) + torch.tanh(torch.tensor(beta * (1 - eta)))
+    return torch.where(passive, torch.ones_like(x), num / den)
+
+
+def beta_at(it):
+    """Projection sharpness continuation: 1, then doubled every BETA_EVERY."""
+    if it < BETA_START:
+        return 1.0
+    return min(BETA_MAX, 2.0 ** (1 + (it - BETA_START) // BETA_EVERY))
+
+
+def optimize(x, theta, n_iter=N_ITER):
+    x_min = 1e-3 * torch.ones_like(x)
+    x_max = torch.ones_like(x)
     with torch.no_grad():
+        rho = physical_density(x, 1.0)
         C0 = [compliance(rho, theta, f).item() for f in (f_drag, f_lift)]
 
     history = []
-    for _ in tqdm(range(n_iter)):
+    for it in tqdm(range(n_iter)):
+        beta = beta_at(it)
+
         # One adjoint per load case (each solve owns its own graph)
+        rho = physical_density(x, beta)
         C_d = W_DRAG * compliance(rho, theta, f_drag) / C0[0]
-        g_d = torch.autograd.grad(C_d, (rho, theta))
+        g_d = torch.autograd.grad(C_d, (x, theta))
+        rho = physical_density(x, beta)
         C_l = W_LIFT * compliance(rho, theta, f_lift) / C0[1]
-        g_l = torch.autograd.grad(C_l, (rho, theta))
+        g_l = torch.autograd.grad(C_l, (x, theta))
         C = C_d + C_l
-        dC_drho, dC_dtheta = g_d[0] + g_l[0], g_d[1] + g_l[1]
+        dC_dx = torch.clamp(g_d[0] + g_l[0], max=-1e-12)
+        dC_dtheta = g_d[1] + g_l[1]
 
-        # Sensitivity filter
-        dC_drho = H @ (rho * dC_drho) / H.sum(dim=0) / rho
-        dC_drho = torch.clamp(dC_drho, max=-1e-12)
-
-        def make_step(mu):
-            upper = torch.min(rho_max, (1 + MOVE) * rho)
-            lower = torch.max(rho_min, (1 - MOVE) * rho)
-            rho_trial = (-dC_drho / mu) ** 0.5 * rho
-            rho_new = torch.max(torch.min(rho_trial, upper), lower)
-            rho_new[passive] = 1.0
-            return rho_new
-
-        def g(mu):
-            return ((make_step(mu) * area).sum() - V_0).item()
+        # Volume sensitivity through filter and projection
+        rho = physical_density(x, beta)
+        dV_dx = torch.autograd.grad((rho * area).sum(), x)[0]
+        dV_dx = torch.clamp(dV_dx, min=1e-12)
 
         with torch.no_grad():
+
+            def make_step(mu):
+                upper = torch.min(x_max, x + MOVE)
+                lower = torch.max(x_min, x - MOVE)
+                x_trial = x * (-dC_dx / (mu * dV_dx)) ** 0.5
+                x_new = torch.max(torch.min(x_trial, upper), lower)
+                x_new[passive] = 1.0
+                return x_new
+
+            def g(mu):
+                rho_k = physical_density(make_step(mu), beta)
+                return ((rho_k * area).sum() - V_0).item()
+
             mu = bisect(g, 1e-12, 1e6)
-            rho.data = make_step(mu)
+            x.data = make_step(mu)
 
             # Normalized gradient step on the angle, then regularize
             step = ORI_MAX_STEP * dC_dtheta / dC_dtheta.abs().max()
-            theta.data = smooth_orientation(theta - step, rho)
+            theta.data = smooth_orientation(theta - step, physical_density(x, beta))
 
         history.append((C.item(), C_d.item() / W_DRAG, C_l.item() / W_LIFT))
     return np.array(history)
@@ -265,6 +294,11 @@ class DirectorField:
     def solid(self, p):
         return self.inside(p) and self.rho(p)[0] >= RHO_SOLID
 
+    def spacing(self, p):
+        """Local path spacing realizing the optimized density with tows."""
+        r = np.clip(self.rho(p)[0], RHO_SOLID, 1.0)
+        return TOW_SPACING / r
+
     def direction(self, p, ref):
         c, s = self.c2(p)[0], self.s2(p)[0]
         if np.hypot(c, s) < 0.05:  # isotropic point, no defined fiber axis
@@ -298,7 +332,7 @@ class PathSet:
         return False
 
 
-def trace(field, paths, seed, d_test, max_len=5.0 * L):
+def trace(field, paths, seed, d_test_ratio, max_len=5.0 * L):
     """Trace a streamline both ways from seed with RK2 until a stop criterion."""
     halves = []
     for sign in (1.0, -1.0):
@@ -318,7 +352,7 @@ def trace(field, paths, seed, d_test, max_len=5.0 * L):
             if k2 is None:
                 break
             q = p + STEP * k2
-            if not field.solid(q) or paths.too_close(q, d_test):
+            if not field.solid(q) or paths.too_close(q, d_test_ratio * field.spacing(q)):
                 break
             # Stop on closed loops
             if len(pts) > 20 and np.hypot(*(q - seed)) < 0.5 * STEP:
@@ -331,9 +365,11 @@ def trace(field, paths, seed, d_test, max_len=5.0 * L):
 
 
 def evenly_spaced_streamlines(field, d_sep, d_test_ratio=0.5, min_len=30.0):
-    """Jobard-Lefer: seed new streamlines at d_sep from accepted ones."""
-    paths = PathSet(cell=d_sep)
-    d_test = d_test_ratio * d_sep
+    """Jobard-Lefer: seed new streamlines one local spacing from accepted ones.
+
+    d_sep is the spacing in fully dense regions; it grows as d_sep / rho.
+    """
+    paths = PathSet(cell=d_sep / RHO_SOLID)
     result = []
 
     # First seeds: a coarse grid over the solid region, longest first
@@ -345,13 +381,14 @@ def evenly_spaced_streamlines(field, d_sep, d_test_ratio=0.5, min_len=30.0):
             p = np.array([xi, yi])
             if field.solid(p):
                 seeds.append(p)
-    queue = list(seeds)
+    # Densest (main load-carrying) members first
+    queue = sorted(seeds, key=lambda p: -field.rho(p)[0])
 
     while queue:
         seed = queue.pop(0)
-        if not field.solid(seed) or paths.too_close(seed, d_sep * 0.99):
+        if not field.solid(seed) or paths.too_close(seed, 0.99 * field.spacing(seed)):
             continue
-        line = trace(field, paths, seed, d_test)
+        line = trace(field, paths, seed, d_test_ratio)
         if line is None or len(line) < 2:
             continue
         seg = np.linalg.norm(np.diff(line, axis=0), axis=1).sum()
@@ -366,8 +403,9 @@ def evenly_spaced_streamlines(field, d_sep, d_test_ratio=0.5, min_len=30.0):
         normal = np.column_stack([-tang[:, 1], tang[:, 0]])
         stride = max(1, int(d_sep / STEP))
         for k in range(0, len(line), stride):
+            sep = field.spacing(line[k])
             for s in (1.0, -1.0):
-                queue.insert(0, line[k] + s * d_sep * normal[k])
+                queue.insert(0, line[k] + s * sep * normal[k])
     return result
 
 
@@ -416,14 +454,18 @@ def export_paths(paths, ordered):
     (OUT / "fiber_paths.json").write_text(json.dumps(data))
 
 
-def main():
-    OUT.mkdir(exist_ok=True)
-    theta = torch.zeros(n_elem, requires_grad=True)  # fibers along the span
-    rho = VOLFRAC * torch.ones(n_elem)
-    rho[passive] = 1.0
-    rho.requires_grad_(True)
+def run_optimization():
+    # Random (smoothed) initial fiber field: a uniform 0 deg start is a
+    # stationary point for members loaded along the chord.
+    torch.manual_seed(0)
+    theta0 = (torch.rand(n_elem) - 0.5) * torch.pi
+    theta = smooth_orientation(theta0, torch.ones(n_elem)).requires_grad_(True)
+    x = VOLFRAC * torch.ones(n_elem)
+    x[passive] = 1.0
+    x.requires_grad_(True)
 
-    history = optimize(rho, theta)
+    history = optimize(x, theta)
+    rho = physical_density(x.detach(), beta_at(N_ITER - 1))
 
     rho_np = rho.detach().numpy()
     th_np = theta.detach().numpy()
@@ -458,7 +500,14 @@ def main():
     fig.tight_layout()
     fig.savefig(OUT / "density_orientation.png", dpi=150)
 
-    # Continuous fiber paths
+
+def generate_paths():
+    """Continuous fiber paths from the design saved by run_optimization()."""
+    design = np.load(OUT / "design.npz")
+    c_np, rho_np, th_np = design["centers"], design["rho"], design["theta"]
+    tri = elements.numpy()
+    xy = nodes[:, :2].numpy()
+
     field = DirectorField(c_np, th_np, rho_np)
     paths = evenly_spaced_streamlines(field, TOW_SPACING)
     ordered, travel = chain_paths(paths)
@@ -479,11 +528,18 @@ def main():
     ax.plot(5, Y_TIP[0] + 10, ".", color="tab:blue")
     ax.text(10, Y_TIP[0] - 5, "LIFT (+z)", color="tab:blue")
     ax.set_aspect("equal")
-    ax.set_title(f"Continuous fiber paths ({len(paths)} tows, spacing {TOW_SPACING} mm)")
+    ax.set_title(
+        f"Continuous fiber paths ({len(paths)} tows, spacing {TOW_SPACING} mm / density)"
+    )
     ax.legend(loc="lower right")
     fig.tight_layout()
     fig.savefig(OUT / "fiber_paths.png", dpi=200)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    OUT.mkdir(exist_ok=True)
+    if "--paths-only" not in sys.argv:
+        run_optimization()
+    generate_paths()
